@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colab-bridge-agent"
+version = "0.1.0"
+description = "Read-only Google Colab runtime telemetry agent for Colab Bridge"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27,<1"]
+license = { text = "MIT" }
+
+[tool.setuptools]
+package-dir = {"" = "agent"}
+
+[tool.setuptools.packages.find]
+where = ["agent"]
+include = ["colab_bridge_agent*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["agent"]
+testpaths = ["agent/tests"]
