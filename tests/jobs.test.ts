@@ -8,8 +8,10 @@ import {
   validateJobRequest,
 } from "../supabase/shared/jobs.ts";
 import { JobService, validateAgentJobBody } from "../supabase/shared/job_api.ts";
+import * as JobApi from "../supabase/shared/job_api.ts";
 
 const RUNTIME_ID = "11111111-1111-4111-8111-111111111111";
+const OTHER_RUNTIME_ID = "55555555-5555-4555-8555-555555555555";
 const LEASE_TOKEN = "22222222-2222-4222-8222-222222222222";
 const REQUEST = {
   kind: "python",
@@ -79,6 +81,22 @@ class FakeJobDatabase {
   calls: Array<{ name: string; args: Record<string, unknown> }> = [];
   nextJob = 1;
 
+  reapExpired(): void {
+    const now = Date.now();
+    for (const job of this.jobs.values()) {
+      const expiresAt = typeof job.lease_expires_at === "string" ? Date.parse(job.lease_expires_at) : Number.NaN;
+      if ((job.status === "running" || job.status === "cancelling") && Number.isFinite(expiresAt) && expiresAt <= now) {
+        const cancelled = job.status === "cancelling" || job.cancel_requested_at !== undefined;
+        Object.assign(job, {
+          status: cancelled ? "cancelled" : "lost",
+          lease_token: null,
+          lease_expires_at: null,
+          error_code: cancelled ? null : "LEASE_EXPIRED",
+        });
+      }
+    }
+  }
+
   storage = {
     from: (_bucket: string) => ({
       createSignedUploadUrl: async (_path: string) => ({ data: { signedUrl: "https://storage.test/upload-token" }, error: null }),
@@ -118,7 +136,8 @@ class FakeJobDatabase {
         spec: args.p_spec,
         project: args.p_project,
         timeout_seconds: args.p_timeout_seconds,
-        runtime_id: args.p_runtime_id,
+        requested_runtime_id: args.p_runtime_id,
+        runtime_id: null,
         require_gpu: args.p_require_gpu,
         idempotency_key: key,
         request_hash: args.p_request_hash,
@@ -129,9 +148,11 @@ class FakeJobDatabase {
       return { data: { ok: true, job_id: id, status: "queued", idempotent: false }, error: null };
     }
     if (name === "colab_bridge_list_jobs") {
+      this.reapExpired();
       return { data: { ok: true, jobs: [...this.jobs.values()] }, error: null };
     }
     if (name === "colab_bridge_get_job") {
+      this.reapExpired();
       const job = this.jobs.get(args.p_job_id as string);
       return { data: job ? { ok: true, job } : { ok: false, error_code: "JOB_NOT_FOUND" }, error: null };
     }
@@ -145,17 +166,40 @@ class FakeJobDatabase {
       return { data: { ok: true, job_id: job.id, status: job.status }, error: null };
     }
     if (name === "colab_bridge_retry_job") {
+      this.reapExpired();
       const source = this.jobs.get(args.p_job_id as string);
       if (!source || !isTerminal(source.status)) return { data: { ok: false, error_code: "JOB_NOT_TERMINAL" }, error: null };
       const id = `00000000-0000-4000-8000-${String(this.nextJob++).padStart(12, "0")}`;
-      this.jobs.set(id, { ...source, id, status: "queued", attempt: (source.attempt as number) + 1, parent_job_id: source.id });
+      this.jobs.set(id, {
+        id,
+        kind: source.kind,
+        spec: source.spec,
+        project: source.project,
+        timeout_seconds: source.timeout_seconds,
+        requested_runtime_id: source.requested_runtime_id,
+        runtime_id: null,
+        require_gpu: source.require_gpu,
+        idempotency_key: args.p_idempotency_key,
+        request_hash: source.request_hash,
+        status: "queued",
+        attempt: (source.attempt as number) + 1,
+        parent_job_id: source.id,
+      });
       return { data: { ok: true, job_id: id, status: "queued" }, error: null };
     }
     if (name === "colab_bridge_claim_job") {
-      const job = [...this.jobs.values()].find((item) => item.status === "queued");
+      const job = [...this.jobs.values()].find((item) =>
+        item.status === "queued" &&
+        (item.requested_runtime_id === null || item.requested_runtime_id === args.p_runtime_id)
+      );
       if (!job) return { data: { ok: true, job: null }, error: null };
       Object.assign(job, { status: "running", runtime_id: args.p_runtime_id, lease_token: LEASE_TOKEN });
-      return { data: { ok: true, job }, error: null };
+      const restoreArtifacts = job.parent_job_id
+        ? [...this.artifacts.values()]
+          .filter((artifact) => artifact.job_id === job.parent_job_id && artifact.status === "published")
+          .map((artifact) => ({ ...artifact }))
+        : undefined;
+      return { data: { ok: true, job: { ...job, restore_artifacts: restoreArtifacts } }, error: null };
     }
     if (name === "colab_bridge_heartbeat_job") {
       return { data: { ok: true, lease_valid: true, cancel_requested: false }, error: null };
@@ -202,6 +246,36 @@ class FakeJobDatabase {
   }
 }
 
+test("Agent job routing validates and dispatches every job operation", async () => {
+  const route = (JobApi as unknown as {
+    dispatchAgentJobOperation?: (service: unknown, body: unknown) => Promise<Record<string, unknown>>;
+  }).dispatchAgentJobOperation;
+  assert.equal(typeof route, "function");
+  if (!route) return;
+
+  const service = {
+    claim: async () => ({ ok: true, routed: "claim" }),
+    heartbeat: async () => ({ ok: true, routed: "heartbeat" }),
+    log: async () => ({ ok: true, routed: "log" }),
+    complete: async () => ({ ok: true, routed: "complete" }),
+    prepareArtifact: async () => ({ ok: true, routed: "prepare" }),
+    completeArtifact: async () => ({ ok: true, routed: "artifact_complete" }),
+  };
+  const lease = { runtime_id: RUNTIME_ID, job_id: "33333333-3333-4333-8333-333333333333", lease_token: LEASE_TOKEN };
+  const cases = [
+    [{ op: "job_claim", runtime_id: RUNTIME_ID }, "claim"],
+    [{ op: "job_heartbeat", ...lease }, "heartbeat"],
+    [{ op: "job_log", ...lease, seq: 0, stream: "stdout", text: "ready" }, "log"],
+    [{ op: "job_complete", ...lease, status: "succeeded", result: {}, exit_code: 0, error_code: null }, "complete"],
+    [{ op: "artifact_prepare", ...lease, path: "result.json", bytes: 2, sha256: "a".repeat(64), mime_type: "application/json" }, "prepare"],
+    [{ op: "artifact_complete", ...lease, artifact_id: "44444444-4444-4444-8444-444444444444" }, "artifact_complete"],
+  ] as const;
+  for (const [body, expected] of cases) {
+    assert.deepEqual(await route(service, body), { ok: true, routed: expected });
+  }
+  await assert.rejects(() => route(service, { op: "job_log", ...lease, seq: -1, stream: "stdout", text: "bad" }));
+});
+
 test("submit is idempotent only for the same normalized payload", async () => {
   const db = new FakeJobDatabase();
   const service = new JobService(db);
@@ -225,11 +299,64 @@ test("cancel preserves terminal jobs and retry creates linked audit history", as
   assert.equal(retriedStatus.job.attempt, 2);
 });
 
+test("retry preserves requested affinity without pinning originally unassigned work", async () => {
+  const portableDb = new FakeJobDatabase();
+  const portableService = new JobService(portableDb);
+  const submitted = await portableService.submit(REQUEST);
+  const firstClaim = await portableService.claim(RUNTIME_ID);
+  await portableService.complete({
+    runtime_id: RUNTIME_ID,
+    job_id: firstClaim.job.id,
+    lease_token: LEASE_TOKEN,
+    status: "succeeded",
+    result: {},
+    exit_code: 0,
+    error_code: null,
+  });
+  const retried = await portableService.retry(submitted.job_id, "portable-retry");
+  assert.equal((await portableService.status(retried.job_id)).job.runtime_id, null);
+  assert.equal((await portableService.claim(OTHER_RUNTIME_ID)).job.id, retried.job_id);
+
+  const pinnedDb = new FakeJobDatabase();
+  const pinnedService = new JobService(pinnedDb);
+  const pinned = await pinnedService.submit({ ...REQUEST, runtime_id: RUNTIME_ID });
+  assert.equal((await pinnedService.claim(OTHER_RUNTIME_ID)).job, null);
+  assert.equal((await pinnedService.claim(RUNTIME_ID)).job.id, pinned.job_id);
+});
+
+test("status reconciles expired offline leases and permits retry", async () => {
+  const lostDb = new FakeJobDatabase();
+  const lostService = new JobService(lostDb);
+  const lostSubmitted = await lostService.submit(REQUEST);
+  await lostService.claim(RUNTIME_ID);
+  lostDb.jobs.get(lostSubmitted.job_id as string)!.lease_expires_at = "2000-01-01T00:00:00Z";
+  const lostStatus = await lostService.status(lostSubmitted.job_id);
+  assert.equal(lostStatus.job.status, "lost");
+  assert.equal((await lostService.retry(lostSubmitted.job_id, "retry-lost")).status, "queued");
+
+  const cancelledDb = new FakeJobDatabase();
+  const cancelledService = new JobService(cancelledDb);
+  const cancelledSubmitted = await cancelledService.submit(REQUEST);
+  await cancelledService.claim(RUNTIME_ID);
+  await cancelledService.cancel(cancelledSubmitted.job_id);
+  cancelledDb.jobs.get(cancelledSubmitted.job_id as string)!.lease_expires_at = "2000-01-01T00:00:00Z";
+  assert.equal((await cancelledService.status(cancelledSubmitted.job_id)).job.status, "cancelled");
+});
+
 test("job listing rejects unknown states instead of silently returning an empty list", async () => {
   const db = new FakeJobDatabase();
   const response = await new JobService(db).list({ status: "finished" });
   assert.deepEqual(response, { ok: false, error_code: "INVALID_FILTER" });
   assert.equal(db.calls.length, 0);
+});
+
+test("generic job reads never expose lease credentials", async () => {
+  const db = new FakeJobDatabase();
+  const service = new JobService(db);
+  const submitted = await service.submit(REQUEST);
+  await service.claim(RUNTIME_ID);
+  assert.equal(JSON.stringify(await service.status(submitted.job_id)).includes("lease_token"), false);
+  assert.equal(JSON.stringify(await service.list({})).includes("lease_token"), false);
 });
 
 test("claimed job operations are RPC fenced and duplicate log events are idempotent", async () => {
@@ -296,6 +423,43 @@ test("artifact publication rejects missing or wrong-sized Storage objects", asyn
     await service.completeArtifact({ runtime_id: RUNTIME_ID, job_id: claimed.job.id, lease_token: LEASE_TOKEN, artifact_id: prepared.artifact_id }),
     { ok: false, error_code: "ARTIFACT_UPLOAD_INCOMPLETE" },
   );
+});
+
+test("retry claims provide signed restore artifact URLs without private storage paths", async () => {
+  const db = new FakeJobDatabase();
+  const service = new JobService(db);
+  const submitted = await service.submit(REQUEST);
+  const firstClaim = await service.claim(RUNTIME_ID);
+  const prepared = await service.prepareArtifact({
+    runtime_id: RUNTIME_ID,
+    job_id: firstClaim.job.id,
+    lease_token: LEASE_TOKEN,
+    path: "outputs/result.json",
+    bytes: 12,
+    sha256: "c".repeat(64),
+    mime_type: "application/json",
+  });
+  assert.equal((await service.completeArtifact({
+    runtime_id: RUNTIME_ID,
+    job_id: firstClaim.job.id,
+    lease_token: LEASE_TOKEN,
+    artifact_id: prepared.artifact_id,
+  })).ok, true);
+  assert.equal((await service.complete({
+    runtime_id: RUNTIME_ID,
+    job_id: firstClaim.job.id,
+    lease_token: LEASE_TOKEN,
+    status: "succeeded",
+    result: {},
+    exit_code: 0,
+    error_code: null,
+  })).ok, true);
+  await service.retry(submitted.job_id, "restore-retry");
+
+  const retryClaim = await service.claim(RUNTIME_ID);
+  assert.equal(retryClaim.job.restore_artifacts[0].download_url, "https://storage.test/download-token");
+  assert.equal(retryClaim.job.restore_artifacts[0].expires_in, 300);
+  assert.equal(JSON.stringify(retryClaim).includes("storage_path"), false);
 });
 
 test("repository errors are returned as stable error codes without raw details", async () => {

@@ -14,6 +14,7 @@ create table public.colab_bridge_jobs (
   project text not null default 'default'
     check (project ~ '^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$'),
   timeout_seconds integer not null default 900 check (timeout_seconds between 1 and 3600),
+  requested_runtime_id uuid references public.colab_bridge_runtimes(runtime_id) on delete set null,
   runtime_id uuid references public.colab_bridge_runtimes(runtime_id) on delete set null,
   require_gpu boolean not null default false,
   idempotency_key text unique check (idempotency_key is null or length(idempotency_key) between 1 and 200),
@@ -44,6 +45,9 @@ create index colab_bridge_jobs_queue_idx
   where status = 'queued';
 create index colab_bridge_jobs_runtime_idx
   on public.colab_bridge_jobs (runtime_id, created_at desc);
+create index colab_bridge_jobs_requested_runtime_idx
+  on public.colab_bridge_jobs (requested_runtime_id, created_at)
+  where status = 'queued';
 create index colab_bridge_jobs_parent_idx
   on public.colab_bridge_jobs (parent_job_id)
   where parent_job_id is not null;
@@ -161,7 +165,7 @@ begin
 
   begin
     insert into public.colab_bridge_jobs (
-      kind, spec, project, timeout_seconds, runtime_id, require_gpu,
+      kind, spec, project, timeout_seconds, requested_runtime_id, require_gpu,
       idempotency_key, request_hash
     ) values (
       p_kind, p_spec, p_project, p_timeout_seconds, p_runtime_id, p_require_gpu,
@@ -180,41 +184,77 @@ begin
 end;
 $$;
 
+create function public.colab_bridge_reap_expired_jobs() returns integer
+language plpgsql
+security invoker
+set search_path = public, pg_temp
+as $$
+declare
+  v_count integer;
+  v_now timestamptz := clock_timestamp();
+begin
+  update public.colab_bridge_jobs
+    set status = case when status = 'cancelling' or cancel_requested_at is not null then 'cancelled' else 'lost' end,
+        lease_token = null, lease_expires_at = null, completed_at = v_now, updated_at = v_now,
+        error_code = case when status = 'cancelling' or cancel_requested_at is not null then null else 'LEASE_EXPIRED' end
+    where status in ('running', 'cancelling')
+      and lease_expires_at <= v_now;
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$$;
+
 create function public.colab_bridge_list_jobs(
   p_status text,
   p_runtime_id uuid,
   p_limit integer
 ) returns jsonb
-language sql
+language plpgsql
 security invoker
 set search_path = public, pg_temp
 as $$
+declare
+  v_jobs jsonb;
+begin
+  perform public.colab_bridge_reap_expired_jobs();
   select jsonb_build_object(
     'ok', true,
     'jobs', coalesce(jsonb_agg(
       to_jsonb(q) - 'lease_token' - 'request_hash' - 'idempotency_key'
       order by q.created_at desc
     ), '[]'::jsonb)
-  )
+  ) into v_jobs
   from (
     select * from public.colab_bridge_jobs j
     where (p_status is null or j.status = p_status)
-      and (p_runtime_id is null or j.runtime_id = p_runtime_id)
+      and (
+        p_runtime_id is null
+        or j.runtime_id = p_runtime_id
+        or (j.status = 'queued' and j.requested_runtime_id = p_runtime_id)
+      )
     order by j.created_at desc
     limit least(greatest(p_limit, 1), 100)
   ) q;
+  return v_jobs;
+end;
 $$;
 
 create function public.colab_bridge_get_job(p_job_id uuid) returns jsonb
-language sql
+language plpgsql
 security invoker
 set search_path = public, pg_temp
 as $$
+declare
+  v_result jsonb;
+begin
+  perform public.colab_bridge_reap_expired_jobs();
   select coalesce(
     (select jsonb_build_object('ok', true, 'job', to_jsonb(j) - 'lease_token' - 'request_hash' - 'idempotency_key')
      from public.colab_bridge_jobs j where j.id = p_job_id),
     jsonb_build_object('ok', false, 'error_code', 'JOB_NOT_FOUND')
-  );
+  ) into v_result;
+  return v_result;
+end;
 $$;
 
 create function public.colab_bridge_job_logs(
@@ -279,6 +319,7 @@ declare
   v_job public.colab_bridge_jobs%rowtype;
   v_hash text;
 begin
+  perform public.colab_bridge_reap_expired_jobs();
   if length(p_idempotency_key) not between 1 and 200 then
     return jsonb_build_object('ok', false, 'error_code', 'INVALID_JOB');
   end if;
@@ -287,14 +328,17 @@ begin
   if v_source.status not in ('succeeded', 'failed', 'cancelled', 'timed_out', 'lost') then
     return jsonb_build_object('ok', false, 'error_code', 'JOB_NOT_TERMINAL');
   end if;
-  v_hash := encode(digest(v_source.id::text || ':' || p_idempotency_key, 'sha256'), 'hex');
+  v_hash := pg_catalog.encode(
+    pg_catalog.sha256(pg_catalog.convert_to(v_source.id::text || ':' || p_idempotency_key, 'UTF8')),
+    'hex'
+  );
   begin
     insert into public.colab_bridge_jobs (
-      kind, spec, project, timeout_seconds, runtime_id, require_gpu,
+      kind, spec, project, timeout_seconds, requested_runtime_id, require_gpu,
       idempotency_key, request_hash, attempt, parent_job_id
     ) values (
       v_source.kind, v_source.spec, v_source.project, v_source.timeout_seconds,
-      v_source.runtime_id, v_source.require_gpu, p_idempotency_key, v_hash,
+      v_source.requested_runtime_id, v_source.require_gpu, p_idempotency_key, v_hash,
       v_source.attempt + 1, v_source.id
     ) returning * into v_job;
   exception when unique_violation then
@@ -318,19 +362,14 @@ declare
   v_job public.colab_bridge_jobs%rowtype;
   v_token uuid;
   v_restore jsonb;
-  v_now timestamptz := clock_timestamp();
+  v_now timestamptz;
 begin
   perform pg_advisory_xact_lock(hashtextextended(p_runtime_id::text, 0));
   select * into v_runtime from public.colab_bridge_runtimes
     where runtime_id = p_runtime_id for update;
   if not found then return jsonb_build_object('ok', false, 'error_code', 'NO_RUNTIME'); end if;
 
-  update public.colab_bridge_jobs
-    set status = case when status = 'cancelling' or cancel_requested_at is not null then 'cancelled' else 'lost' end,
-        lease_token = null, lease_expires_at = null, completed_at = v_now, updated_at = v_now,
-        error_code = case when status = 'cancelling' or cancel_requested_at is not null then null else 'LEASE_EXPIRED' end
-    where status in ('running', 'cancelling')
-      and lease_expires_at <= v_now;
+  perform public.colab_bridge_reap_expired_jobs();
 
   if v_runtime.runtime_metadata ->> 'execution_enabled' is distinct from 'true' then
     return jsonb_build_object('ok', true, 'job', null);
@@ -345,13 +384,14 @@ begin
   select j.* into v_job
   from public.colab_bridge_jobs j
   where status = 'queued'
-    and (runtime_id is null or runtime_id = p_runtime_id)
-    and (not require_gpu or v_runtime.accelerator in ('nvidia_gpu', 'nvidia'))
+    and (requested_runtime_id is null or requested_runtime_id = p_runtime_id)
+    and (not require_gpu or v_runtime.accelerator = 'nvidia_gpu')
   order by created_at
   for update skip locked
   limit 1;
   if not found then return jsonb_build_object('ok', true, 'job', null); end if;
 
+  v_now := clock_timestamp();
   v_token := gen_random_uuid();
   update public.colab_bridge_jobs
     set status = 'running', runtime_id = p_runtime_id, lease_token = v_token,
@@ -362,7 +402,8 @@ begin
 
   if v_job.parent_job_id is not null then
     select coalesce(jsonb_agg(jsonb_build_object(
-      'id', a.id, 'path', a.path, 'bytes', a.bytes, 'sha256', a.sha256, 'mime_type', a.mime_type
+      'id', a.id, 'path', a.path, 'bytes', a.bytes, 'sha256', a.sha256,
+      'mime_type', a.mime_type, 'storage_path', a.storage_path
     ) order by a.created_at), '[]'::jsonb)
       into v_restore
     from public.colab_bridge_artifacts a
@@ -393,10 +434,14 @@ set search_path = public, pg_temp
 as $$
 declare
   v_job public.colab_bridge_jobs%rowtype;
-  v_now timestamptz := clock_timestamp();
+  v_now timestamptz;
 begin
   select * into v_job from public.colab_bridge_jobs where id = p_job_id for update;
-  if not found or v_job.runtime_id is distinct from p_runtime_id or v_job.lease_token is distinct from p_lease_token
+  if not found then
+    return jsonb_build_object('ok', true, 'lease_valid', false, 'cancel_requested', false);
+  end if;
+  v_now := clock_timestamp();
+  if v_job.runtime_id is distinct from p_runtime_id or v_job.lease_token is distinct from p_lease_token
     or v_job.status not in ('running', 'cancelling') then
     return jsonb_build_object('ok', true, 'lease_valid', false, 'cancel_requested', false);
   end if;
@@ -590,6 +635,7 @@ end;
 $$;
 
 revoke all on function public.colab_bridge_submit_job(text, jsonb, text, integer, uuid, boolean, text, text) from public;
+revoke all on function public.colab_bridge_reap_expired_jobs() from public;
 revoke all on function public.colab_bridge_list_jobs(text, uuid, integer) from public;
 revoke all on function public.colab_bridge_get_job(uuid) from public;
 revoke all on function public.colab_bridge_job_logs(uuid, bigint, integer) from public;
@@ -605,6 +651,7 @@ revoke all on function public.colab_bridge_publish_artifact(uuid, uuid, uuid, uu
 revoke all on function public.colab_bridge_list_artifacts(uuid) from public;
 
 grant execute on function public.colab_bridge_submit_job(text, jsonb, text, integer, uuid, boolean, text, text) to service_role;
+grant execute on function public.colab_bridge_reap_expired_jobs() to service_role;
 grant execute on function public.colab_bridge_list_jobs(text, uuid, integer) to service_role;
 grant execute on function public.colab_bridge_get_job(uuid) to service_role;
 grant execute on function public.colab_bridge_job_logs(uuid, bigint, integer) to service_role;

@@ -2,6 +2,13 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { verifyKey } from "../../shared/auth.ts";
 import { filterAllowedCommands, PayloadValidationError, validateAgentBody } from "../../shared/agent_logic.ts";
+import {
+  dispatchAgentJobOperation,
+  isAgentJobOperation,
+  JobService,
+  validateAgentJobBody,
+} from "../../shared/job_api.ts";
+import { JobValidationError } from "../../shared/jobs.ts";
 
 const MAX_BODY_BYTES = 256 * 1024;
 const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
@@ -9,6 +16,7 @@ const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const db = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
+const jobs = new JobService(db);
 
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -44,13 +52,17 @@ async function parseBody(req: Request): Promise<Record<string, unknown>> {
   } catch {
     throw new PayloadValidationError("INVALID_PAYLOAD", "body must be valid JSON");
   }
-  return validateAgentBody(parsed);
+  return isAgentJobOperation(parsed) ? validateAgentJobBody(parsed) : validateAgentBody(parsed);
 }
 
 async function handleOperation(body: Record<string, unknown>): Promise<Response> {
   const now = new Date().toISOString();
   const runtimeId = body.runtime_id as string;
   const op = body.op as string;
+
+  if (isAgentJobOperation(body)) {
+    return response(await dispatchAgentJobOperation(jobs, body));
+  }
 
   if (op === "register") {
     const payload = body.payload as Record<string, unknown>;
@@ -148,7 +160,7 @@ Deno.serve(async (req: Request) => {
     const body = await parseBody(req);
     return await handleOperation(body);
   } catch (error) {
-    if (error instanceof PayloadValidationError) {
+    if (error instanceof PayloadValidationError || error instanceof JobValidationError) {
       const status = error.code === "PAYLOAD_TOO_LARGE" ? 413 : 400;
       return response({ ok: false, error_code: error.code, message: error.message }, status);
     }

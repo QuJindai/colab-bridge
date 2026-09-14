@@ -7,7 +7,7 @@ import {
   TERMINAL_COMPLETION_STATUSES,
 } from "./jobs.ts";
 
-const AGENT_JOB_OPERATIONS = new Set([
+export const AGENT_JOB_OPERATIONS = new Set([
   "job_claim",
   "job_heartbeat",
   "job_log",
@@ -103,6 +103,35 @@ export function validateAgentJobBody(input: unknown): JsonObject {
   return input;
 }
 
+export function isAgentJobOperation(input: unknown): boolean {
+  return isObject(input) && typeof input.op === "string" && AGENT_JOB_OPERATIONS.has(input.op);
+}
+
+type AgentJobService = Pick<
+  JobService,
+  "claim" | "heartbeat" | "log" | "complete" | "prepareArtifact" | "completeArtifact"
+>;
+
+export async function dispatchAgentJobOperation(service: AgentJobService, input: unknown): Promise<JsonObject> {
+  const body = validateAgentJobBody(input);
+  switch (body.op) {
+    case "job_claim":
+      return await service.claim(body.runtime_id);
+    case "job_heartbeat":
+      return await service.heartbeat(body);
+    case "job_log":
+      return await service.log(body);
+    case "job_complete":
+      return await service.complete(body);
+    case "artifact_prepare":
+      return await service.prepareArtifact(body);
+    case "artifact_complete":
+      return await service.completeArtifact(body);
+    default:
+      throw new JobValidationError("UNKNOWN_OPERATION", "operation is not a job operation");
+  }
+}
+
 function resultObject(value: unknown): JsonObject | null {
   if (Array.isArray(value) && value.length === 1 && isObject(value[0])) return value[0];
   return isObject(value) ? value : null;
@@ -112,6 +141,12 @@ function publicArtifact(raw: unknown): JsonObject | null {
   if (!isObject(raw)) return null;
   const { storage_path: _privatePath, ...artifact } = raw;
   return artifact;
+}
+
+function publicJob(raw: unknown): JsonObject | null {
+  if (!isObject(raw)) return null;
+  const { lease_token: _leaseToken, request_hash: _requestHash, idempotency_key: _idempotencyKey, ...job } = raw;
+  return job;
 }
 
 export class JobService {
@@ -164,18 +199,24 @@ export class JobService {
         throw new JobValidationError("INVALID_FILTER", "status is invalid");
       }
       if (filters.runtime_id !== undefined && !isUuid(filters.runtime_id)) throw new JobValidationError("INVALID_FILTER", "runtime_id is invalid");
-      return await this.rpc("colab_bridge_list_jobs", {
+      const result = await this.rpc("colab_bridge_list_jobs", {
         p_status: typeof filters.status === "string" ? filters.status : null,
         p_runtime_id: filters.runtime_id ?? null,
         p_limit: limit,
       });
+      if (result.ok === true && Array.isArray(result.jobs)) {
+        return { ...result, jobs: result.jobs.map(publicJob).filter(Boolean) };
+      }
+      return result;
     });
   }
 
   async status(id: unknown): Promise<JsonObject> {
     return await this.safely(async () => {
       requireUuid(id, "job_id");
-      return await this.rpc("colab_bridge_get_job", { p_job_id: id });
+      const result = await this.rpc("colab_bridge_get_job", { p_job_id: id });
+      if (result.ok === true && isObject(result.job)) return { ...result, job: publicJob(result.job) };
+      return result;
     });
   }
 
@@ -209,7 +250,19 @@ export class JobService {
   async claim(runtimeId: unknown): Promise<JsonObject> {
     return await this.safely(async () => {
       requireUuid(runtimeId, "runtime_id");
-      return await this.rpc("colab_bridge_claim_job", { p_runtime_id: runtimeId });
+      const result = await this.rpc("colab_bridge_claim_job", { p_runtime_id: runtimeId });
+      if (result.ok !== true || !isObject(result.job) || result.job.restore_artifacts === undefined) return result;
+      if (!Array.isArray(result.job.restore_artifacts)) return { ok: false, error_code: "BACKEND_ERROR" };
+      const restoreArtifacts: JsonObject[] = [];
+      for (const raw of result.job.restore_artifacts) {
+        if (!isObject(raw) || typeof raw.storage_path !== "string") return { ok: false, error_code: "BACKEND_ERROR" };
+        const downloadUrl = await this.createArtifactDownload(raw.storage_path);
+        if (!downloadUrl) return { ok: false, error_code: "STORAGE_ERROR" };
+        const artifact = publicArtifact(raw);
+        if (!artifact) return { ok: false, error_code: "BACKEND_ERROR" };
+        restoreArtifacts.push({ ...artifact, download_url: downloadUrl, expires_in: 300 });
+      }
+      return { ...result, job: { ...result.job, restore_artifacts: restoreArtifacts } };
     });
   }
 
