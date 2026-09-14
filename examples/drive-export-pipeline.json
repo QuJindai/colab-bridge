@@ -1,0 +1,11 @@
+{
+  "kind": "pipeline",
+  "project": "drive-report",
+  "timeout_seconds": 120,
+  "spec": {
+    "steps": [
+      {"id": "report", "kind": "file", "spec": {"path": "report.json", "text": "{\"experiment\":\"example\",\"status\":\"ready\"}\n"}},
+      {"id": "drive", "kind": "drive_export", "spec": {"source_path": "report.json", "mode": "mount", "destination": "colab-bridge/example-report.json"}}
+    ]
+  }
+}

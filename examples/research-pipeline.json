@@ -1,0 +1,57 @@
+{
+  "kind": "pipeline",
+  "project": "tiny-research",
+  "timeout_seconds": 900,
+  "spec": {
+    "resume": false,
+    "steps": [
+      {
+        "id": "download",
+        "kind": "model_download",
+        "spec": {
+          "provider": "huggingface",
+          "model_id": "sshleifer/tiny-gpt2",
+          "revision": "5f91d94bd9cd7190a9f3216ff93cd1dd95f2c7be",
+          "output_dir": "model"
+        }
+      },
+      {
+        "id": "training-data",
+        "kind": "file",
+        "spec": {
+          "path": "data/train.jsonl",
+          "text": "{\"text\":\"Research records make experiments reproducible.\"}\n{\"text\":\"Keep model revisions and training checkpoints.\"}\n{\"text\":\"Measure token latency and decode throughput separately.\"}\n{\"text\":\"Save the adapter and verify exported artifacts.\"}\n"
+        }
+      },
+      {
+        "id": "baseline",
+        "kind": "benchmark",
+        "spec": {"model_path": "model", "prompt": "Research is", "max_new_tokens": 16, "device": "auto"}
+      },
+      {
+        "id": "train",
+        "kind": "lora",
+        "spec": {
+          "model_path": "model",
+          "data_path": "data/train.jsonl",
+          "output_dir": "adapter",
+          "max_steps": 4,
+          "checkpoint_every": 1,
+          "rank": 2,
+          "target_modules": ["c_attn"],
+          "device": "auto"
+        }
+      },
+      {
+        "id": "adapted-benchmark",
+        "kind": "benchmark",
+        "spec": {"model_path": "model", "adapter_path": "adapter/final", "prompt": "Research is", "max_new_tokens": 16, "device": "auto"}
+      },
+      {
+        "id": "export",
+        "kind": "export",
+        "spec": {"model_path": "model", "adapter_path": "adapter/final", "format": "onnx", "output_path": "export/model.onnx", "sample_text": "Research is reproducible"}
+      }
+    ]
+  }
+}

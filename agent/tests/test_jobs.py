@@ -793,3 +793,41 @@ def test_run_agent_retries_transient_registration_and_probe_errors(monkeypatch):
     assert register_ids == [runtime_id, runtime_id]
     assert len(heartbeat_payloads) == 2
     assert heartbeat_payloads[-1]["agent_version"] == "0.2.0"
+
+
+@pytest.mark.parametrize('checkpoint', [False, True])
+def test_terminal_only_publication_obeys_deadline(tmp_path, monkeypatch, checkpoint):
+    import threading
+    import colab_bridge_agent.jobs as jobs
+    from colab_bridge_agent.recipes_impl.common import publish
+    release = threading.Event()
+    uploaded = threading.Event()
+    monkeypatch.setattr(jobs, 'PUBLICATION_DRAIN_SECONDS', .05)
+    def terminal_job(job, workspace, emit, cancelled):
+        relative = 'checkpoint/checkpoint.json' if checkpoint else 'output.txt'
+        path = workspace / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{}')
+        if checkpoint:
+            publish(workspace, [relative])
+        return {'status': 'succeeded', 'result': {}, 'exit_code': 0, 'error_code': None,
+                'artifacts': jobs._artifact_manifest(workspace, [relative])}
+    monkeypatch.setattr(jobs, 'execute_job', terminal_job)
+    class Slow(RecordingClient):
+        def upload_artifact(self, *args):
+            uploaded.set()
+            release.wait(.5)
+            super().upload_artifact(*args)
+    client = Slow(job('python', {'code': ''}))
+    started = time.monotonic()
+    JobRunner(AgentConfig('https://example.test/agent', 'secret', workspace_root=str(tmp_path)), client, 'runtime').run_once()
+    elapsed = time.monotonic() - started
+    release.set()
+    assert elapsed < .2
+    assert uploaded.is_set()
+    terminal = next(call for call in client.calls if call[0] == 'job_complete')
+    assert terminal[1] == 'failed' and terminal[4] == 'ARTIFACT_UPLOAD_FAILED'
+    assert terminal[2]['checkpoint_publication'] == {'complete': False}
+    time.sleep(.1)
+    assert not any(call[0] == 'artifact_complete' for call in client.calls)
+    assert len([call for call in client.calls if call[0] == 'prepare']) == 1

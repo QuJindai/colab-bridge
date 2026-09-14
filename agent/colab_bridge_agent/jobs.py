@@ -29,6 +29,7 @@ MUTATION_RETRY_SECONDS = 0.2
 COMPLETION_RETRY_SECONDS = 0.2
 LOG_DELIVERY_DRAIN_SECONDS = 0.1
 TERMINATION_GRACE_SECONDS = 0.25
+PUBLICATION_DRAIN_SECONDS = 5.0
 
 
 class _Interrupted(Exception):
@@ -427,9 +428,13 @@ def execute_job(job: dict[str, Any], workspace: str | Path, emit: Callable[[dict
         error_code = "CANCELLED" if interrupted.status == "cancelled" else "TIMEOUT"
         return finish({"status": interrupted.status, "result": None, "exit_code": None,
                        "error_code": error_code, "artifacts": []})
-    except Exception:
+    except Exception as error:
         delivery.emit({"stream": "system", "text": "Job validation failed\n"})
-        return finish(_failure("INVALID_JOB"))
+        code = getattr(error, "code", "INVALID_JOB")
+        outcome = _failure(code)
+        if code != "INVALID_JOB":
+            outcome["result"] = {"error": {"code": code, "message": str(error)}}
+        return finish(outcome)
 
     try:
         _check_interrupted(deadline, cancelled)
@@ -477,23 +482,81 @@ def execute_job(job: dict[str, Any], workspace: str | Path, emit: Callable[[dict
         status, error_code = "failed", "PROCESS_EXIT"
     result_value = None
     manifests: list[dict[str, Any]] = []
-    if status == "succeeded":
-        try:
-            manifests = _artifact_manifest(workspace_path, recipe.get("artifacts", []))
-            result_path = recipe.get("result_path")
-            if result_path is not None:
-                if not isinstance(result_path, str):
-                    raise ValueError("result_path must be a string")
-                with resolve_workspace_path(workspace_path, result_path).open(encoding="utf-8") as handle:
+    try:
+        result_path = recipe.get("result_path")
+        if result_path is not None:
+            path = resolve_workspace_path(workspace_path, result_path)
+            if path.exists():
+                with path.open(encoding="utf-8") as handle:
                     result_value = json.load(handle)
-        except FileNotFoundError:
-            delivery.emit({"stream": "system", "text": "An expected output is missing\n"})
-            status, error_code = "failed", "ARTIFACT_MISSING"
-        except (ValueError, OSError, json.JSONDecodeError):
-            delivery.emit({"stream": "system", "text": "Could not collect job outputs\n"})
-            status, error_code = "failed", "OUTPUT_INVALID"
+                if not isinstance(result_value, dict):
+                    result_value = None
+                    raise ValueError("job result must be a JSON object")
+                if status == "failed" and isinstance(result_value.get("error"), dict):
+                    code = result_value["error"].get("code")
+                    if isinstance(code, str) and code and len(code) <= 64:
+                        error_code = code
+            elif status == "succeeded":
+                raise FileNotFoundError(result_path)
+        if status == "succeeded":
+            paths = list(recipe.get("artifacts", []))
+            if job.get("kind") not in {"python", "shell", "pip"} and result_value:
+                paths.extend(result_value.get("artifacts", []))
+            manifests = _artifact_manifest(workspace_path, paths)
+    except FileNotFoundError:
+        delivery.emit({"stream": "system", "text": "An expected output is missing\n"})
+        status, error_code = "failed", "ARTIFACT_MISSING"
+    except (ValueError, OSError, TypeError):
+        delivery.emit({"stream": "system", "text": "Could not collect job outputs\n"})
+        status, error_code = "failed", "OUTPUT_INVALID"
+    try:
+        checkpoint_paths = []
+        for _, paths in _publication_manifests(workspace_path, include_ack=True):
+            checkpoint_paths.extend(paths)
+        retained = _artifact_manifest(workspace_path, checkpoint_paths)
+        manifests = list({item["path"]: item for item in manifests + retained}.values())
+    except (ValueError, OSError, TypeError):
+        if status == "succeeded":
+            status, error_code = "failed", "CHECKPOINT_INVALID"
     return finish({"status": status, "result": result_value, "exit_code": returncode,
                    "error_code": error_code, "artifacts": manifests})
+
+
+def _checkpoint_order(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # A published checkpoint.json is the durable completion marker. Register it last.
+    return sorted(manifests, key=lambda item: (item['path'].endswith('/checkpoint.json'),
+                                               -len(Path(item['path']).parts) if item['path'].endswith('/checkpoint.json') else 0))
+
+
+def _publication_manifests(workspace: Path, *, include_ack: bool = False):
+    folder = resolve_workspace_path(workspace, ".colab-bridge/publish")
+    if not folder.exists():
+        return
+    candidates = sorted(folder.iterdir())
+    if len(candidates) > 2048:
+        raise ValueError("too many checkpoint manifests")
+    for path in candidates:
+        if path.suffix not in ({".json", ".ack"} if include_ack else {".json"}):
+            continue
+        try:
+            if path.is_symlink() or path.stat().st_size > 1024 * 1024:
+                raise ValueError("invalid checkpoint manifest")
+            value = json.loads(path.read_text())
+        except FileNotFoundError:
+            if not include_ack or not path.with_suffix(".ack").exists():
+                continue
+            value = json.loads(path.with_suffix(".ack").read_text())
+        if not isinstance(value, dict):
+            raise ValueError("checkpoint manifest must be an object")
+        paths = value.get("artifacts")
+        if value.get("version") != 1 or not isinstance(paths, list) or not 1 <= len(paths) <= 10000:
+            raise ValueError("invalid checkpoint manifest schema")
+        for relative in paths:
+            target = resolve_workspace_path(workspace, relative)
+            if target.is_symlink() or not target.is_file():
+                raise ValueError("checkpoint entries must be closed regular workspace files")
+        yield path, paths
+
 
 
 class JobRunner:
@@ -649,38 +712,112 @@ class JobRunner:
                 return True
             if lease_lost.is_set():
                 return True
-            outcome = execute_job(
-                job,
-                workspace,
-                emit,
-                lambda: cancellation.is_set() or lease_lost.is_set() or self.stop_event.is_set(),
-            )
+            published: dict[str, str] = {}
+            publication_ready = threading.Event()
+            publication_wake = threading.Event()
+            publication_success = threading.Event()
+            publication_deadline: list[float | None] = [None]
+            terminal_artifacts: list[dict[str, Any]] = []
+            publication_abort = threading.Event()
+            publication_errors: list[str] = []
+
+            def check_publication() -> None:
+                deadline = publication_deadline[0]
+                if deadline is not None and time.monotonic() >= deadline:
+                    publication_abort.set()
+                if lease_lost.is_set() or publication_abort.is_set():
+                    raise RuntimeError("publication ended")
+
+            def persist(manifest: dict[str, Any]) -> None:
+                check_publication()
+                previous = published.get(manifest["path"])
+                if previous is not None:
+                    if previous != manifest["sha256"]:
+                        raise ValueError("published checkpoint changed")
+                    return
+                prepared = self.client.artifact_prepare(self.runtime_id, job_id, lease_token, **manifest)
+                if prepared.get("error_code") in {"LEASE_INVALID", "STALE_LEASE", "LEASE_LOST", "INVALID_LEASE"}:
+                    lease_lost.set()
+                if (prepared.get("ok") is not True or prepared.get("upload_method") != "PUT"
+                        or not isinstance(prepared.get("artifact_id"), str)
+                        or not isinstance(prepared.get("upload_url"), str)):
+                    raise RuntimeError("artifact preparation failed")
+                check_publication()
+                path = resolve_workspace_path(workspace, manifest["path"])
+                self.client.upload_artifact(prepared["upload_url"], path, manifest["mime_type"])
+                check_publication()
+                # Detect accidental mutation during upload before registering the object.
+                if _artifact_manifest(workspace, [manifest["path"]])[0] != manifest:
+                    raise ValueError("checkpoint changed during upload")
+                check_publication()
+                completed = self.client.artifact_complete(
+                    self.runtime_id, job_id, lease_token, prepared["artifact_id"])
+                if completed.get("error_code") in {"LEASE_INVALID", "STALE_LEASE", "LEASE_LOST", "INVALID_LEASE"}:
+                    lease_lost.set()
+                if completed.get("ok") is not True:
+                    raise RuntimeError("artifact registration failed")
+                published[manifest["path"]] = manifest["sha256"]
+
+            def publish_checkpoints() -> None:
+                while not publication_abort.is_set() and not lease_lost.is_set():
+                    terminal = publication_ready.is_set()
+                    try:
+                        check_publication()
+                        if terminal:
+                            for manifest in _checkpoint_order(terminal_artifacts):
+                                persist(manifest)
+                        for path, paths in _publication_manifests(workspace):
+                            check_publication()
+                            for manifest in _checkpoint_order(_artifact_manifest(workspace, paths)):
+                                persist(manifest)
+                            check_publication()
+                            path.rename(path.with_suffix(".ack"))
+                        if terminal:
+                            check_publication()
+                            publication_success.set()
+                            return
+                    except Exception:
+                        if terminal:
+                            return
+                    if not publication_ready.is_set():
+                        publication_wake.wait(0.1)
+                        publication_wake.clear()
+
+            publisher = threading.Thread(target=publish_checkpoints, name="colab-checkpoint-upload", daemon=True)
+            publisher.start()
+            try:
+                outcome = execute_job(
+                    job, workspace, emit,
+                    lambda: cancellation.is_set() or lease_lost.is_set() or self.stop_event.is_set(),
+                )
+            except BaseException:
+                publication_abort.set()
+                publication_wake.set()
+                raise
+            # Terminal outputs and pending checkpoints use the same uploader and deadline.
+            # Publication I/O and upload hash rechecks stay off the completion thread.
+            terminal_artifacts.extend(outcome["artifacts"])
+            publication_deadline[0] = time.monotonic() + PUBLICATION_DRAIN_SECONDS
+            publication_ready.set()
+            publication_wake.set()
+            while publisher.is_alive() and not lease_lost.is_set():
+                remaining = publication_deadline[0] - time.monotonic()
+                if remaining <= 0:
+                    break
+                publisher.join(timeout=min(0.05, remaining))
+            if not publication_success.is_set():
+                publication_abort.set()
+                publication_errors[:] = ["CHECKPOINT_UPLOAD_FAILED"]
             if lease_lost.is_set():
                 return True
             if self.stop_event.is_set() and outcome["status"] == "cancelled":
                 outcome["error_code"] = "AGENT_STOPPED"
-            if outcome["status"] == "succeeded":
-                try:
-                    for manifest in outcome["artifacts"]:
-                        if lease_lost.is_set() or cancellation.is_set():
-                            break
-                        prepared = self.client.artifact_prepare(self.runtime_id, job_id, lease_token, **manifest)
-                        if (prepared.get("ok") is not True or prepared.get("upload_method") != "PUT"
-                                or not isinstance(prepared.get("artifact_id"), str)
-                                or not isinstance(prepared.get("upload_url"), str)):
-                            raise RuntimeError("artifact preparation failed")
-                        path = resolve_workspace_path(workspace, manifest["path"])
-                        self.client.upload_artifact(prepared["upload_url"], path, manifest["mime_type"])
-                        if lease_lost.is_set():
-                            return True
-                        completed = self.client.artifact_complete(
-                            self.runtime_id, job_id, lease_token, prepared["artifact_id"])
-                        if completed.get("ok") is not True:
-                            raise RuntimeError("artifact registration failed")
-                    if cancellation.is_set():
-                        outcome.update(status="cancelled", result=None, error_code="CANCELLED")
-                except Exception:
-                    outcome.update(status="failed", result=None, error_code="ARTIFACT_UPLOAD_FAILED")
+            if publication_errors:
+                if outcome["status"] == "succeeded":
+                    outcome.update(status="failed", error_code="ARTIFACT_UPLOAD_FAILED")
+                outcome["result"] = {**(outcome["result"] or {}), "checkpoint_publication": {"complete": False}}
+            if cancellation.is_set() and outcome["status"] == "succeeded":
+                outcome.update(status="cancelled", error_code="CANCELLED")
             if lease_lost.is_set():
                 return True
             complete(outcome)
