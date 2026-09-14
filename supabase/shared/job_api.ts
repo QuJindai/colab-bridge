@@ -237,13 +237,20 @@ export class JobService {
     });
   }
 
-  async retry(id: unknown, key: unknown): Promise<JsonObject> {
+  async retry(id: unknown, key: unknown, checkpointPath?: unknown): Promise<JsonObject> {
     return await this.safely(async () => {
       requireUuid(id, "job_id");
       if (typeof key !== "string" || key.length < 1 || key.length > 200) {
         throw new JobValidationError("INVALID_JOB", "retry idempotency key is invalid");
       }
-      return await this.rpc("colab_bridge_retry_job", { p_job_id: id, p_idempotency_key: key });
+      if (checkpointPath !== undefined && !validArtifactPath(checkpointPath)) {
+        throw new JobValidationError("CHECKPOINT_INVALID", "checkpoint must be relative");
+      }
+      return await this.rpc("colab_bridge_retry_job", {
+        p_job_id: id,
+        p_idempotency_key: key,
+        ...(checkpointPath !== undefined ? { p_checkpoint_path: checkpointPath } : {}),
+      });
     });
   }
 

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   MCP_TOOL_CATALOG,
+  TELEMETRY_TOOL_CATALOG,
   buildGpuStatus,
   buildRuntimeStatus,
   sanitizeNvidiaSmi,
@@ -17,9 +18,10 @@ const liveRuntime = {
   last_heartbeat_at: "2026-09-12T09:59:40.000Z",
 };
 
-test("every MCP tool is explicitly read-only", () => {
-  assert.equal(MCP_TOOL_CATALOG.length, 7);
-  for (const tool of MCP_TOOL_CATALOG) {
+test("the seven original telemetry tools stay read-only", () => {
+  assert.equal(MCP_TOOL_CATALOG.length, 31);
+  assert.equal(TELEMETRY_TOOL_CATALOG.length, 7);
+  for (const tool of TELEMETRY_TOOL_CATALOG) {
     assert.equal(tool.annotations.readOnlyHint, true, tool.name);
     assert.equal(tool.annotations.destructiveHint, false, tool.name);
   }

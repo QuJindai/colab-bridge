@@ -1,6 +1,8 @@
 import { runtimeState } from "./freshness.ts";
 
-export const MCP_TOOL_CATALOG = [
+import { EXECUTION_TOOL_NAMES, executionAnnotations } from "./execution_tools.ts";
+
+export const TELEMETRY_TOOL_CATALOG = [
   { name: "colab_capabilities", annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } },
   { name: "colab_list_runtimes", annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } },
   { name: "colab_gpu_status", annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } },
@@ -9,6 +11,11 @@ export const MCP_TOOL_CATALOG = [
   { name: "colab_processes", annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } },
   { name: "colab_health", annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } },
 ] as const;
+
+export const MCP_TOOL_CATALOG = [
+  ...TELEMETRY_TOOL_CATALOG,
+  ...EXECUTION_TOOL_NAMES.map((name) => ({ name, annotations: executionAnnotations(name) })),
+];
 
 type RuntimeRow = {
   runtime_id: string;

@@ -32,3 +32,37 @@ export function extractPresentedKey(url: string, headers: Headers, dedicatedHead
     return "";
   }
 }
+
+export type BridgeRole = "read" | "control";
+export async function authenticateBridge(
+  req: Request,
+  db: any,
+): Promise<
+  { ok: true; role: BridgeRole } | {
+    ok: false;
+    status: number;
+    error_code: string;
+  }
+> {
+  const raw = extractPresentedKey(req.url, req.headers, "X-Colab-Bridge-Key");
+  if (!raw) return { ok: false, status: 401, error_code: "UNAUTHORIZED" };
+  try {
+    const { data, error } = await db.from("colab_bridge_access_keys").select(
+      "key_kind,key_hash",
+    ).in("key_kind", ["bridge", "control"]);
+    if (error || !Array.isArray(data)) {
+      return { ok: false, status: 503, error_code: "BACKEND_UNAVAILABLE" };
+    }
+    for (const row of data) {
+      if (await verifyKey(raw, row.key_hash)) {
+        return {
+          ok: true,
+          role: row.key_kind === "control" ? "control" : "read",
+        };
+      }
+    }
+    return { ok: false, status: 401, error_code: "UNAUTHORIZED" };
+  } catch {
+    return { ok: false, status: 503, error_code: "BACKEND_UNAVAILABLE" };
+  }
+}
