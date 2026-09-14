@@ -1,0 +1,117 @@
+{
+  "format_version": 1,
+  "status": "recovery_checkpoint_final_review_incomplete",
+  "date": "2026-09-14",
+  "reviewed_public_parent": "0c52885ca952730f05130a02f1f3f611a10247e2",
+  "last_confirmed_local_commit": "5732e702b4294498ff0d29c775f22643be7704d7",
+  "last_confirmed_implementation_commit": "fe2325094ba86111a76f206f09e6085fc2e1bdf2",
+  "deployments": [
+    {
+      "name": "colab-bridge-agent",
+      "version": 3,
+      "bundle_sha256": "9c5322532320e5d0223619f488e42b79f5f70672eaf47a49a93741c739719891"
+    },
+    {
+      "name": "colab-bridge-mcp",
+      "version": 5,
+      "bundle_sha256": "628ef63494a9a11adb52f1551dfbb0ea3ad81b52f0eec7d5b20a4869add5b13a"
+    }
+  ],
+  "wheel": {
+    "path": "colab_bridge_agent-0.2.0-py3-none-any.whl",
+    "bytes": 36924,
+    "sha256": "5ca7a947b4d8aa906fd907a871c9667eb4d10efaa2fde9845f169dde0e7ab612"
+  },
+  "notebook": {
+    "path": "colab_bridge_bootstrap.ipynb",
+    "bytes": 56750,
+    "sha256": "6cef9f91881a8956b035d934a8e2db60fe71efd0c52ebc0b0682e58449b0af5a",
+    "embedded_wheel_matches": true
+  },
+  "deployment_files": [
+    {
+      "path": "deployment/supabase/functions/colab-bridge-agent/index.ts",
+      "bytes": 6589,
+      "sha256": "347858fa8c45292596b2e3ec869af8be2874fe57bfbc2079518d70f905ecdf74"
+    },
+    {
+      "path": "deployment/supabase/shared/auth.ts",
+      "bytes": 2239,
+      "sha256": "4eadc7e97a0fec3174d1743ef7a9da0edc3e99a92df6edf5ad848feee9b546c2"
+    },
+    {
+      "path": "deployment/supabase/shared/agent_logic.ts",
+      "bytes": 3324,
+      "sha256": "3ee8fb25eee64dfee21a4399c53e4dedbd716217474b1e65492106612af47c1f"
+    },
+    {
+      "path": "deployment/supabase/shared/job_api.ts",
+      "bytes": 17302,
+      "sha256": "04b83770170fbbb993a26adcc96ec8f0a657cd40de1a9411a6a94caea4663757"
+    },
+    {
+      "path": "deployment/supabase/shared/jobs.ts",
+      "bytes": 5777,
+      "sha256": "13eefe7a61a5bf2794fdb3b3d8f6036667a33be117ce8965c4e7714b07b5153f"
+    },
+    {
+      "path": "deployment/supabase/functions/colab-bridge-mcp/index.ts",
+      "bytes": 1495,
+      "sha256": "22c3d31cbafbfcbd7a1ca730c9f9e5a80d09774465eb60368b4099df0d304017"
+    },
+    {
+      "path": "deployment/supabase/shared/mcp_server.ts",
+      "bytes": 11453,
+      "sha256": "b7b0d6f6dc84c9ed452d6fea1f5d9db806f8ccf8bb5739f75838c93c6cba3654"
+    },
+    {
+      "path": "deployment/supabase/shared/freshness.ts",
+      "bytes": 461,
+      "sha256": "e28d16c062ecd51a214c0eb905708af6eb897c9f38f0ecc3f5a504dc738f564c"
+    },
+    {
+      "path": "deployment/supabase/shared/mcp_tools.ts",
+      "bytes": 6626,
+      "sha256": "d30cd9489d3df8e4caa6ac5cf489f7f20d6b6e301fae9ff91276b1348a67c876"
+    },
+    {
+      "path": "deployment/supabase/shared/execution_tools.ts",
+      "bytes": 4458,
+      "sha256": "223bed8f9d4f7ea100218acc5fae81fdd505fb02da1e5e7ca040ed82768b61e6"
+    },
+    {
+      "path": "deployment/supabase/shared/execution_schemas.ts",
+      "bytes": 8185,
+      "sha256": "e50b0821bac54b27b983302e4f3822a26d06ba669f688f827c47e56c4493844d"
+    },
+    {
+      "path": "deployment/supabase/shared/lifecycle.ts",
+      "bytes": 13095,
+      "sha256": "d634061ef1e9bd904d55dc575ba7fa171d47eaff77911046a76a84856f29eabd"
+    },
+    {
+      "path": "deployment/supabase/shared/providers.ts",
+      "bytes": 9618,
+      "sha256": "3aa0781a3ae1376d44d2cc5a71c20c19cb49b9a6c4ce92782a7997d590c141eb"
+    },
+    {
+      "path": "deployment/supabase/shared/bootstrap.ts",
+      "bytes": 6563,
+      "sha256": "056a25ed20089916e377600fad08aa8adc13aaea17cb186126ee2a30e4b7ed2e"
+    },
+    {
+      "path": "deployment/supabase/shared/bootstrap_payload.ts",
+      "bytes": 51224,
+      "sha256": "71d3d664705f941531cd7c891631b185fceced8d7adbe442f63a60f136d702ed"
+    }
+  ],
+  "missing_acceptance": [
+    "task5_lock_and_log_evidence_fixes",
+    "scoped_task5_rereview",
+    "whole_branch_review",
+    "native_control_submission",
+    "real_colab_gpu",
+    "eligible_provider_cold_start"
+  ],
+  "original_environment": "offline"
+}
