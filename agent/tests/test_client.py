@@ -182,3 +182,64 @@ def test_run_agent_executes_one_complete_cycle(monkeypatch):
     assert kinds == ["register", "snapshot", "snapshot", "snapshot", "heartbeat", "poll", "result"]
     assert events[-1][3] == "completed"
     assert events[-1][4] == {"accelerator": "nvidia_gpu", "gpus": [{"name": "L4"}]}
+
+
+def test_signed_download_redirects_never_inherit_client_credentials():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, dict(request.headers)))
+        if request.url.path == "/start":
+            return httpx.Response(
+                302,
+                headers={
+                    "Location": "https://storage.test/final",
+                    "Set-Cookie": "redirect-session=test-cookie; Path=/",
+                },
+            )
+        return httpx.Response(200, content=b"artifact")
+
+    client = AgentClient(
+        "https://example.test/agent",
+        "agent-secret",
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            headers={"X-Default-Credential": "leak"},
+            cookies={"existing": "cookie"},
+            auth=httpx.BasicAuth("user", "password"),
+        ),
+    )
+    assert client.download_artifact("https://storage.test/start") == b"artifact"
+    assert [path for path, _ in seen] == ["/start", "/final"]
+    for _, headers in seen:
+        assert "authorization" not in headers
+        assert "cookie" not in headers
+        assert "x-default-credential" not in headers
+
+
+def test_signed_download_redirects_are_https_and_bounded():
+    redirects = 0
+
+    def looping_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal redirects
+        redirects += 1
+        return httpx.Response(302, headers={"Location": "/again"})
+
+    looping = AgentClient(
+        "https://example.test/agent",
+        "secret",
+        http_client=httpx.Client(transport=httpx.MockTransport(looping_handler)),
+    )
+    with pytest.raises(httpx.TooManyRedirects):
+        looping.download_artifact("https://storage.test/start")
+    assert redirects == 6
+
+    insecure = AgentClient(
+        "https://example.test/agent",
+        "secret",
+        http_client=httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(302, headers={"Location": "http://storage.test/final"})
+        )),
+    )
+    with pytest.raises(ValueError, match="HTTPS"):
+        insecure.download_artifact("https://storage.test/start")
